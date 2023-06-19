@@ -7,7 +7,7 @@
 
 @test "Verify unfs installed" {
   # ensure unfs executable exists
-  run docker exec "unfs-test" bash -c "[ -f /data/sbin/unfsd ]"
+  run docker exec "unfs-test" bash -c "[ -f /usr/sbin/unfsd ]"
 
   [ "$status" -eq 0 ]
 }

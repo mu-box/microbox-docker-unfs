@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ v* ]
+  pull_request:
+    branches: [ main ]
+  repository_dispatch:
+  workflow_dispatch:
+
+env:
+  DOCKER_REGISTRY: ${{ secrets.DOCKER_REGISTRY || 'ghcr.io' }}
+  DOCKER_TARGET_PLATFORM: linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64/v8,linux/ppc64le,linux/s390x
+
+jobs:
+  test:
+    name: Test ${{ matrix.service }} ${{ matrix.version }} Image
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - unfs
+        version:
+          - '0.9'
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@v2
+
+      - name: Setup Test Network
+        run: docker network create --driver=bridge --subnet=192.168.0.0/16 --opt="com.docker.network.driver.mtu=1450" --opt="com.docker.network.bridge.name=redd0" microbox-test
+
+      - name: Test Image
+        run: |
+          docker buildx build -t mubox/${{ matrix.service }}:${{ matrix.version }} ${{ matrix.version }}
+          sudo stdbuf -oL test/run_all.sh ${{ matrix.version }}
+
+      - name: Test Hooks
+        if: github.actor != 'nektos/act'
+        run: |
+          git clone https://github.com/mu-box/microbox-hooks-${{ matrix.service }} hooks
+          sudo stdbuf -oL hooks/test/run_all.sh ${{ matrix.version }}
+
+      - name: Cleanup Test Network
+        if: always()
+        run: docker network rm microbox-test
+
+  build:
+    name: Build ${{ matrix.service }} ${{ matrix.version }} Images
+    runs-on: ubuntu-latest
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - unfs
+        version:
+          - 0.9
+    env:
+      DOCKER_IMAGE: ${{ secrets.DOCKER_NAMESPACE || github.actor }}/${{ matrix.service }}
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@v2
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Prepare
+        if: success()
+        id: prepare
+        run: |
+          echo ::set-output name=docker_platform::${DOCKER_TARGET_PLATFORM}
+          echo ::set-output name=docker_image::${DOCKER_REGISTRY}/${DOCKER_IMAGE}
+          echo ::set-output name=version::${GITHUB_RUN_NUMBER}
+
+      - name: Docker login
+        uses: docker/login-action@v1
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME || github.actor }}
+          password: ${{ secrets.DOCKER_PASSWORD || github.token }}
+
+      - name: Actually Build ${{ matrix.version }} Image
+        if: success()
+        run: |
+          ref_name=$(echo ${{ github.ref }} | sed -E 's:^refs/[^/]+/::')
+          tag=${{ matrix.version }}-action-${{ steps.prepare.outputs.version }}
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            if [ "${ref_name}" = "main" ]; then
+              tag=${{ matrix.version }}
+            elif [ "${ref_name}" != "" ]; then
+              tag=${{ matrix.version }}-${ref_name}
+            fi
+          fi
+          docker buildx build \
+            --platform ${{ steps.prepare.outputs.docker_platform }} \
+            --tag ${{ steps.prepare.outputs.docker_image }}-beta:${{ matrix.version }} \
+            --tag ${{ steps.prepare.outputs.docker_image }}:${tag} \
+            --file ${{ matrix.version }}/Dockerfile \
+            --push \
+            ${{ matrix.version }}
